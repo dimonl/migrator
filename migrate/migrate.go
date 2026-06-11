@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"slices"
 	"sort"
 	"strconv"
@@ -28,38 +29,8 @@ type Migrator struct {
 	tableName       string
 	legacyTableName string
 	disableDown     bool
-}
-
-type Option func(*Migrator)
-
-// WithDisabledDownMigrations disables rollback migrations; use for production
-// environments where down migrations should never run automatically.
-func WithDisabledDownMigrations() Option {
-	return func(mg *Migrator) {
-		mg.disableDown = true
-	}
-}
-
-// WithTableName sets a custom name for the migrations tracking table.
-func WithTableName(name string) Option {
-	return func(mg *Migrator) {
-		mg.tableName = name
-	}
-}
-
-// WithLegacyTableName sets a custom name for the legacy schema_migrations table.
-func WithLegacyTableName(name string) Option {
-	return func(mg *Migrator) {
-		mg.legacyTableName = name
-	}
-}
-
-// WithDialect sets a specific dialect for the migrator.
-// If not provided, the dialect is auto-detected from the database driver.
-func WithDialect(dialect Dialect) Option {
-	return func(mg *Migrator) {
-		mg.dialect = dialect
-	}
+	logger          *slog.Logger
+	dryRun          bool
 }
 
 func NewMigrator(db *sqlx.DB, migrFS fs.FS, opts ...Option) *Migrator {
@@ -190,47 +161,109 @@ func (mg *Migrator) Migrate(ctx context.Context) (err error) {
 	return nil
 }
 
+func parseMigrationFile(name string) (version int, versionStr string, ok bool) {
+	// Expected format: {version}_{name}.up.sql or {version}_{name}.down.sql
+	// Remove the direction suffix first
+	var stem string
+	switch {
+	case strings.HasSuffix(name, ".up.sql"):
+		stem = strings.TrimSuffix(name, ".up.sql")
+	case strings.HasSuffix(name, ".down.sql"):
+		stem = strings.TrimSuffix(name, ".down.sql")
+	default:
+		return 0, "", false
+	}
+
+	// Find the first underscore to separate version from name
+	idx := strings.Index(stem, "_")
+	if idx <= 0 {
+		return 0, "", false
+	}
+
+	versionStr = stem[:idx]
+	n, err := strconv.Atoi(versionStr)
+	if err != nil {
+		return 0, "", false
+	}
+
+	return n, versionStr, true
+}
+
 func (mg *Migrator) getMigrationsFromFiles() ([]migration, error) {
-	upMigrations, err := fs.Glob(mg.fs, "*.up.sql")
+	entries, err := fs.Glob(mg.fs, "*.sql")
 	if err != nil {
-		return nil, fmt.Errorf("failed to get up migrations: %w", err)
+		return nil, fmt.Errorf("failed to list migration files: %w", err)
 	}
 
-	downMigrations, err := fs.Glob(mg.fs, "*.down.sql")
-	if err != nil {
-		return nil, fmt.Errorf("failed to get down migrations: %w", err)
+	if len(entries) == 0 {
+		return nil, errors.New("no migration files found")
 	}
 
-	if len(upMigrations) != len(downMigrations) {
-		return nil, errors.New("quantity of up migrations doesn't fit to quantity of down migrations")
-	}
+	// Separate up and down migrations
+	upFiles := make(map[string]string) // version -> filename
+	downFiles := make(map[string]string)
 
-	migrations := make([]migration, 0, len(upMigrations))
-	for _, entryUp := range upMigrations {
-		if i := strings.Index(entryUp, "_"); i > -1 {
-			n, err := strconv.Atoi(entryUp[:i])
-			if err != nil {
-				return nil, fmt.Errorf("failed to parse migration Version: %w", err)
-			}
-			b, err := fs.ReadFile(mg.fs, entryUp)
-			if err != nil {
-				return nil, fmt.Errorf("failed to read up migration: %w", err)
-			}
-			c, err := fs.ReadFile(mg.fs, strings.ReplaceAll(entryUp, ".up.", ".down."))
-			if err != nil {
-				return nil, fmt.Errorf("failed to read down migration: %w", err)
-			}
-
-			migrations = append(migrations, migration{
-				Version:     n,
-				ContentUp:   string(b),
-				ContentDown: string(c),
-			})
+	for _, entry := range entries {
+		version, verStr, ok := parseMigrationFile(entry)
+		if !ok {
+			continue
 		}
+		if strings.HasSuffix(entry, ".up.sql") {
+			if _, dup := upFiles[verStr]; dup {
+				return nil, fmt.Errorf("duplicate up migration for version %s: %s", verStr, entry)
+			}
+			upFiles[verStr] = entry
+		} else if strings.HasSuffix(entry, ".down.sql") {
+			if _, dup := downFiles[verStr]; dup {
+				return nil, fmt.Errorf("duplicate down migration for version %s: %s", verStr, entry)
+			}
+			downFiles[verStr] = entry
+		}
+		_ = version
 	}
-	slices.SortFunc(migrations, func(a, b migration) int {
-		return cmp.Compare(a.Version, b.Version)
+
+	if len(upFiles) != len(downFiles) {
+		return nil, fmt.Errorf("mismatched migration pairs: %d up files, %d down files", len(upFiles), len(downFiles))
+	}
+
+	// Collect all version strings and sort them numerically
+	type versionEntry struct {
+		version    int
+		versionStr string
+	}
+
+	versions := make([]versionEntry, 0, len(upFiles))
+	for verStr := range upFiles {
+		n, err := strconv.Atoi(verStr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid version number: %s", verStr)
+		}
+		versions = append(versions, versionEntry{version: n, versionStr: verStr})
+	}
+	slices.SortFunc(versions, func(a, b versionEntry) int {
+		return cmp.Compare(a.version, b.version)
 	})
+
+	migrations := make([]migration, 0, len(versions))
+	for _, ve := range versions {
+		upFile := upFiles[ve.versionStr]
+		downFile := downFiles[ve.versionStr]
+
+		b, err := fs.ReadFile(mg.fs, upFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read up migration %s: %w", upFile, err)
+		}
+		c, err := fs.ReadFile(mg.fs, downFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read down migration %s: %w", downFile, err)
+		}
+
+		migrations = append(migrations, migration{
+			Version:     ve.version,
+			ContentUp:   string(b),
+			ContentDown: string(c),
+		})
+	}
 	return migrations, nil
 }
 
@@ -401,6 +434,161 @@ func (mg *Migrator) getLastMigration(ctx context.Context, tx *sqlx.Tx) (int, err
 		return 0, errors.New("wrong data: internal DB error")
 	}
 	return lastScheme[0], nil
+}
+
+// ForceSetVersion manually inserts a version into the migrations table as if it
+// was completed. This is useful for repairing a dirty migration state.
+// It does NOT execute any migration SQL — it only records the version.
+func (mg *Migrator) ForceSetVersion(ctx context.Context, version int, upScript, downScript string) error {
+	if mg.dialect == nil {
+		return errors.New("migrator: dialect is not set")
+	}
+	if mg.dryRun {
+		mg.log("dry-run: would set version %d", version)
+		return nil
+	}
+	m := migration{
+		Version:     version,
+		ContentUp:   upScript,
+		ContentDown: downScript,
+	}
+	tx, err := mg.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("force set version: begin tx: %w", err)
+	}
+	if err := mg.insertMigrationToDB(ctx, tx, m); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+// ForceDown rolls back the last N migrations without checking errors strictly.
+// It deletes migration records from DB even if the down SQL fails (best-effort).
+// If N is 0 or negative, no action is taken.
+func (mg *Migrator) ForceDown(ctx context.Context, n int) error {
+	if mg.dialect == nil {
+		return errors.New("migrator: dialect is not set")
+	}
+	if n <= 0 {
+		return nil
+	}
+
+	p1 := mg.dialect.Placeholder(1)
+	query := fmt.Sprintf("SELECT version, up_script, down_script, error FROM %s ORDER BY version DESC LIMIT %s", mg.tableName, p1)
+
+	// Get migrations from DB
+	var m []migration
+	if err := mg.db.SelectContext(ctx, &m, query, n); err != nil {
+		return fmt.Errorf("force down: get migrations: %w", err)
+	}
+
+	for i := range m {
+		if mg.dryRun {
+			mg.log("dry-run: would rollback version %d (SQL: %s)", m[i].Version, m[i].ContentDown)
+			mg.log("dry-run: would delete version %d from tracking table", m[i].Version)
+			continue
+		}
+
+		// Use a separate transaction for each migration to ensure best-effort cleanup
+		tx, txErr := mg.db.BeginTxx(ctx, nil)
+		if txErr != nil {
+			return fmt.Errorf("force down: begin tx: %w", txErr)
+		}
+
+		_ = execMigration(ctx, tx, m[i].ContentDown)
+		if err := mg.deleteMigrationFromDB(ctx, tx, m[i]); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("force down: commit tx: %w", err)
+		}
+		mg.log("force-down: rolled back version %d (errors ignored)", m[i].Version)
+	}
+	return nil
+}
+
+// DB returns the underlying database connection.
+func (mg *Migrator) DB() *sqlx.DB {
+	return mg.db
+}
+
+// MigrationStatus represents the status of a single migration.
+type MigrationStatus struct {
+	Version int
+	Status  string // "applied", "pending", "dirty"
+	Error   string
+}
+
+// Status returns the status of all migrations (both from DB and files).
+func (mg *Migrator) Status(ctx context.Context) ([]MigrationStatus, error) {
+	if mg.dialect == nil {
+		return nil, errors.New("migrator: dialect is not set")
+	}
+
+	// Get migrations from DB directly (not in a transaction)
+	var dbMigrations []migration
+	query := fmt.Sprintf("SELECT version, up_script, down_script, error FROM %s ORDER BY version ASC", mg.tableName)
+	if err := mg.db.SelectContext(ctx, &dbMigrations, query); err != nil {
+		// If the table doesn't exist, treat as no migrations applied
+		dbMigrations = nil
+	}
+
+	// Get migrations from files
+	fsMigrations, err := mg.getMigrationsFromFiles()
+	if err != nil {
+		return nil, err
+	}
+
+	// Build a map of DB migrations
+	dbMap := make(map[int]migration)
+	for _, m := range dbMigrations {
+		dbMap[m.Version] = m
+	}
+
+	var statuses []MigrationStatus
+	// For all file migrations, determine status
+	for _, fm := range fsMigrations {
+		s := MigrationStatus{Version: fm.Version}
+		if dm, exists := dbMap[fm.Version]; exists {
+			if dm.MigrationError != "" {
+				s.Status = "dirty"
+				s.Error = dm.MigrationError
+			} else {
+				s.Status = "applied"
+			}
+		} else {
+			s.Status = "pending"
+		}
+		statuses = append(statuses, s)
+	}
+	return statuses, nil
+}
+
+// CurrentVersion returns the latest applied migration version.
+// Returns 0 if no migrations have been applied.
+func (mg *Migrator) CurrentVersion(ctx context.Context) (int, error) {
+	if mg.dialect == nil {
+		return 0, errors.New("migrator: dialect is not set")
+	}
+
+	var maxVersion *int
+	query := fmt.Sprintf("SELECT MAX(version) FROM %s", mg.tableName)
+	err := mg.db.GetContext(ctx, &maxVersion, query)
+	if err != nil {
+		return 0, fmt.Errorf("get current version: %w", err)
+	}
+	if maxVersion == nil {
+		return 0, nil
+	}
+	return *maxVersion, nil
+}
+
+func (mg *Migrator) log(format string, args ...any) {
+	if mg.logger != nil {
+		mg.logger.Info(fmt.Sprintf(format, args...))
+	}
 }
 
 func (mg *Migrator) lockMigrationTable(ctx context.Context) (*sqlx.Tx, error) {
