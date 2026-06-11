@@ -8,6 +8,9 @@
 *.so
 *.dylib
 
+*.md
+!README.md
+
 # Test binary, built with `go test -c`
 *.test
 
