@@ -22,9 +22,12 @@ type migration struct {
 }
 
 type Migrator struct {
-	db          *sqlx.DB
-	fs          fs.FS
-	disableDown bool
+	db              *sqlx.DB
+	dialect         Dialect
+	fs              fs.FS
+	tableName       string
+	legacyTableName string
+	disableDown     bool
 }
 
 type Option func(*Migrator)
@@ -37,19 +40,71 @@ func WithDisabledDownMigrations() Option {
 	}
 }
 
+// WithTableName sets a custom name for the migrations tracking table.
+func WithTableName(name string) Option {
+	return func(mg *Migrator) {
+		mg.tableName = name
+	}
+}
+
+// WithLegacyTableName sets a custom name for the legacy schema_migrations table.
+func WithLegacyTableName(name string) Option {
+	return func(mg *Migrator) {
+		mg.legacyTableName = name
+	}
+}
+
+// WithDialect sets a specific dialect for the migrator.
+// If not provided, the dialect is auto-detected from the database driver.
+func WithDialect(dialect Dialect) Option {
+	return func(mg *Migrator) {
+		mg.dialect = dialect
+	}
+}
+
 func NewMigrator(db *sqlx.DB, migrFS fs.FS, opts ...Option) *Migrator {
 	mg := &Migrator{
-		db: db,
-		fs: migrFS,
+		db:              db,
+		fs:              migrFS,
+		tableName:       "migrations",
+		legacyTableName: "schema_migrations",
 	}
 	for _, opt := range opts {
 		opt(mg)
 	}
+
+	// Auto-detect dialect if not set via option
+	if mg.dialect == nil {
+		driverName := db.DriverName()
+		d, err := DetectDialect(driverName)
+		if err != nil {
+			// Store the error to be returned on first use
+			// For now, just leave dialect nil — Migrate will check
+			_ = err
+		} else {
+			mg.dialect = d
+		}
+	}
+
 	return mg
 }
 
-func InitDB(ctx context.Context, dsn string, migrFS fs.FS) (*sqlx.DB, error) {
-	db, err := sqlx.Open("postgres", dsn)
+func InitDB(ctx context.Context, dsn string, migrFS fs.FS, opts ...Option) (*sqlx.DB, error) {
+	// Create a temporary migrator just to get the dialect
+	temp := &Migrator{
+		tableName:       "migrations",
+		legacyTableName: "schema_migrations",
+	}
+	for _, opt := range opts {
+		opt(temp)
+	}
+
+	driverName := "postgres"
+	if temp.dialect != nil {
+		driverName = temp.dialect.DriverName()
+	}
+
+	db, err := sqlx.Open(driverName, dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -58,7 +113,10 @@ func InitDB(ctx context.Context, dsn string, migrFS fs.FS) (*sqlx.DB, error) {
 		return nil, err
 	}
 
-	migrator := NewMigrator(db, migrFS)
+	migrator := NewMigrator(db, migrFS, opts...)
+	if migrator.dialect == nil {
+		return nil, fmt.Errorf("failed to detect database dialect for driver: %s", db.DriverName())
+	}
 
 	if err = migrator.UpdateMigrationList(ctx); err != nil {
 		return nil, fmt.Errorf("migrationList: %w", err)
@@ -71,6 +129,10 @@ func InitDB(ctx context.Context, dsn string, migrFS fs.FS) (*sqlx.DB, error) {
 }
 
 func (mg *Migrator) Migrate(ctx context.Context) (err error) {
+	if mg.dialect == nil {
+		return errors.New("migrator: dialect is not set")
+	}
+
 	tx, err := mg.lockMigrationTable(ctx)
 	if err != nil {
 		return fmt.Errorf("lock migration table: %w", err)
@@ -101,13 +163,13 @@ func (mg *Migrator) Migrate(ctx context.Context) (err error) {
 			err = execMigration(ctx, tx, diffBD[i].ContentDown)
 			if err != nil {
 				diffBD[i].MigrationError = err.Error()
-				if mErr := markMigrationAsDirtyToDB(ctx, tx, diffBD[i]); mErr != nil {
+				if mErr := mg.markMigrationAsDirtyToDB(ctx, tx, diffBD[i]); mErr != nil {
 					return mErr
 				}
 				return err
 			}
 
-			err = deleteMigrationFromDB(ctx, tx, diffBD[i])
+			err = mg.deleteMigrationFromDB(ctx, tx, diffBD[i])
 			if err != nil {
 				return err
 			}
@@ -119,7 +181,7 @@ func (mg *Migrator) Migrate(ctx context.Context) (err error) {
 		if err != nil {
 			return err
 		}
-		err = insertMigrationToDB(ctx, tx, m)
+		err = mg.insertMigrationToDB(ctx, tx, m)
 		if err != nil {
 			return err
 		}
@@ -174,11 +236,8 @@ func (mg *Migrator) getMigrationsFromFiles() ([]migration, error) {
 
 func (mg *Migrator) getMigrationsFromDB(ctx context.Context, tx *sqlx.Tx) ([]migration, error) {
 	m := make([]migration, 0)
-	err := tx.SelectContext(
-		ctx,
-		&m,
-		"SELECT version, up_script, down_script, error FROM migrations ORDER BY version ASC",
-	)
+	query := fmt.Sprintf("SELECT version, up_script, down_script, error FROM %s ORDER BY version ASC", mg.tableName)
+	err := tx.SelectContext(ctx, &m, query)
 	if err != nil {
 		return nil, fmt.Errorf("get migrations from DB: %w", err)
 	}
@@ -190,31 +249,35 @@ func (mg *Migrator) getMigrationsFromDB(ctx context.Context, tx *sqlx.Tx) ([]mig
 	return m, nil
 }
 
-func insertMigrationToDB(ctx context.Context, tx *sqlx.Tx, m migration) error {
-	_, err := tx.ExecContext(ctx, `
-		INSERT INTO migrations (version, up_script,down_script, error)
-		VALUES ($1,  $2, $3,  $4)
-	`, m.Version, m.ContentUp, m.ContentDown, m.MigrationError)
+func (mg *Migrator) insertMigrationToDB(ctx context.Context, tx *sqlx.Tx, m migration) error {
+	p1 := mg.dialect.Placeholder(1)
+	p2 := mg.dialect.Placeholder(2)
+	p3 := mg.dialect.Placeholder(3)
+	p4 := mg.dialect.Placeholder(4)
+	query := fmt.Sprintf(`INSERT INTO %s (version, up_script, down_script, error) VALUES (%s, %s, %s, %s)`,
+		mg.tableName, p1, p2, p3, p4)
+	_, err := tx.ExecContext(ctx, query, m.Version, m.ContentUp, m.ContentDown, m.MigrationError)
 	if err != nil {
 		return fmt.Errorf("insert migration: %w", err)
 	}
 	return nil
 }
 
-func deleteMigrationFromDB(ctx context.Context, tx *sqlx.Tx, m migration) error {
-	_, err := tx.ExecContext(ctx, `
-		DELETE FROM migrations WHERE version = $1
-	`, m.Version)
+func (mg *Migrator) deleteMigrationFromDB(ctx context.Context, tx *sqlx.Tx, m migration) error {
+	p1 := mg.dialect.Placeholder(1)
+	query := fmt.Sprintf("DELETE FROM %s WHERE version = %s", mg.tableName, p1)
+	_, err := tx.ExecContext(ctx, query, m.Version)
 	if err != nil {
 		return fmt.Errorf("delete migration: %w", err)
 	}
 	return nil
 }
 
-func markMigrationAsDirtyToDB(ctx context.Context, tx *sqlx.Tx, m migration) error {
-	_, err := tx.ExecContext(ctx, `
-		UPDATE migrations SET error = $1 WHERE version = $2
-	`, m.MigrationError, m.Version)
+func (mg *Migrator) markMigrationAsDirtyToDB(ctx context.Context, tx *sqlx.Tx, m migration) error {
+	p1 := mg.dialect.Placeholder(1)
+	p2 := mg.dialect.Placeholder(2)
+	query := fmt.Sprintf("UPDATE %s SET error = %s WHERE version = %s", mg.tableName, p1, p2)
+	_, err := tx.ExecContext(ctx, query, m.MigrationError, m.Version)
 	if err != nil {
 		return fmt.Errorf("mark migration as dirty: %w", err)
 	}
@@ -263,29 +326,23 @@ func (mg *Migrator) UpdateMigrationList(ctx context.Context) error {
 }
 
 func (mg *Migrator) updateMigrations(ctx context.Context, migrations []migration) error {
-	migrationTableExist, err := mg.tableExist(ctx, "migrations")
+	migrationTableExist, err := mg.tableExist(ctx, mg.tableName)
 	if err != nil {
-		return fmt.Errorf("check migrations table: %w", err)
+		return fmt.Errorf("check %s table: %w", mg.tableName, err)
 	}
 
-	schemaMigrationsTableExist, err := mg.tableExist(ctx, "schema_migrations")
+	schemaMigrationsTableExist, err := mg.tableExist(ctx, mg.legacyTableName)
 	if err != nil {
-		return fmt.Errorf("check migrations table: %w", err)
+		return fmt.Errorf("check %s table: %w", mg.legacyTableName, err)
 	}
 
 	if migrationTableExist {
 		return nil
 	}
 
-	insertTable := `CREATE TABLE migrations (
-    version varchar not null primary key,
-    up_script varchar not null,
-    down_script varchar not null,
-    error varchar)
-    `
-	_, err = mg.db.ExecContext(ctx, insertTable)
+	_, err = mg.db.ExecContext(ctx, mg.dialect.CreateMigrationsTableSQL(mg.tableName))
 	if err != nil {
-		return fmt.Errorf("create table migrations: %w", err)
+		return fmt.Errorf("create table %s: %w", mg.tableName, err)
 	}
 
 	if !schemaMigrationsTableExist {
@@ -310,7 +367,7 @@ func (mg *Migrator) updateMigrations(ctx context.Context, migrations []migration
 
 	for _, m := range migrations {
 		if m.Version <= schemeNumber {
-			if err := insertMigrationToDB(ctx, tx, m); err != nil {
+			if err := mg.insertMigrationToDB(ctx, tx, m); err != nil {
 				return err
 			}
 		}
@@ -323,12 +380,7 @@ func (mg *Migrator) updateMigrations(ctx context.Context, migrations []migration
 
 func (mg *Migrator) tableExist(ctx context.Context, tableName string) (bool, error) {
 	var exist []bool
-	err := mg.db.SelectContext(
-		ctx,
-		&exist,
-		`select exists(select 1 from information_schema.tables where table_name::text=$1)`,
-		tableName,
-	)
+	err := mg.db.SelectContext(ctx, &exist, mg.dialect.TableExistsSQL(tableName))
 	if err != nil {
 		return false, fmt.Errorf("check table: %w", err)
 	}
@@ -340,7 +392,7 @@ func (mg *Migrator) tableExist(ctx context.Context, tableName string) (bool, err
 
 func (mg *Migrator) getLastMigration(ctx context.Context, tx *sqlx.Tx) (int, error) {
 	var lastScheme []int
-	err := sqlx.SelectContext(ctx, tx, &lastScheme, `select version from schema_migrations`)
+	err := sqlx.SelectContext(ctx, tx, &lastScheme, mg.dialect.GetLastMigrationSQL(mg.legacyTableName))
 	if err != nil {
 		return 0, fmt.Errorf("internal DB error: %w", err)
 	}
@@ -357,9 +409,12 @@ func (mg *Migrator) lockMigrationTable(ctx context.Context) (*sqlx.Tx, error) {
 		return nil, err
 	}
 
-	_, err = tx.Exec(`LOCK TABLE migrations IN SHARE ROW EXCLUSIVE MODE`)
-	if err != nil {
-		return nil, err
+	lockSQL := mg.dialect.LockTableSQL(mg.tableName)
+	if lockSQL != "" {
+		_, err = tx.Exec(lockSQL)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return tx, nil
